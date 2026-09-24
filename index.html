@@ -67,7 +67,7 @@ const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.1, 500)
 const clock = new THREE.Clock();
 
 /* --- Scene render target: cols x rows, satu texel = satu sel --- */
-let cols = Math.floor(innerWidth/8), rows = Math.floor(innerHeight/16);
+let cols = Math.floor(innerWidth/7), rows = Math.floor(innerHeight/14);
 const sceneRT = new THREE.WebGLRenderTarget(cols, rows, {
   minFilter: THREE.NearestFilter,
   magFilter: THREE.NearestFilter
@@ -84,7 +84,12 @@ function buildAtlas(){
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillStyle = '#fff';
-  for (let i = 0; i < 16; i++) ctx.fillText(RAMP[i], i*16+8, 16);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;              // stroke tebal: glyph tetap terbaca disusutkan ke sel 7x14
+  for (let i = 0; i < 16; i++) {
+    ctx.fillText(RAMP[i], i*16+8, 16);
+    ctx.strokeText(RAMP[i], i*16+8, 16);
+  }
   const tex = new THREE.CanvasTexture(c);
   tex.minFilter = THREE.NearestFilter;
   tex.magFilter = THREE.NearestFilter;
@@ -108,6 +113,7 @@ void main(){
   vec3 s = texture2D(tScene, (cell + 0.5) / uGrid).rgb;
   vec3 col = pow(s, vec3(1.0/2.2));               // linear -> display
   float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+  lum = pow(clamp((lum - 0.055) / 0.945, 0.0, 1.0), 0.68);  // black point: langit/kabut tetap spasi; lift midtone: batu terang terpisah dari rumput
   float idx = clamp(floor(lum * 16.0), 0.0, 15.0);
   vec2 auv = vec2((idx + within.x) / 16.0, within.y);
   float a = texture2D(tAtlas, auv).a;
@@ -207,7 +213,7 @@ sun.shadow.camera.updateProjectionMatrix();
 scene.add(sun);
 
 /* Kabut: warna identik background -> tepi dunia tak pernah terlihat */
-scene.fog = new THREE.Fog(0x040509, 30, 190);
+scene.fog = new THREE.Fog(0x040509, 60, 190); // near=60: kastil dari spawn tetap kontras; far=190 wajib -> tepi dunia (jarak min190) selalu tertutup
 
 /* ============================================================
    Step 4 — Kastil (tabel plan) + COLLIDERS
@@ -549,8 +555,8 @@ function resize(){
   renderer.setSize(w, h);
   camera.aspect = w/h;
   camera.updateProjectionMatrix();
-  cols = Math.max(1, Math.floor(w/8));
-  rows = Math.max(1, Math.floor(h/16));
+  cols = Math.max(1, Math.floor(w/7));
+  rows = Math.max(1, Math.floor(h/14));
   sceneRT.setSize(cols, rows);
   asciiMat.uniforms.uGrid.value.set(cols, rows);
 }
