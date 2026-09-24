@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KASTIL ASCII</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:"Courier New",monospace}
+canvas{display:block;width:100%;height:100%}
+#hud{position:fixed;color:#a8ff9e;text-shadow:0 0 4px #000;pointer-events:none;z-index:10}
+#cross{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);font-size:16px}
+#legend{position:fixed;top:8px;left:10px;font-size:13px}
+#stats{position:fixed;bottom:8px;left:10px;font-size:13px;white-space:pre}
+#overlay{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(4,4,8,.55);color:#a8ff9e;z-index:20;text-align:center;cursor:pointer;pointer-events:auto}
+</style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js"}}
+</script>
+<script>
+window.__ASCII_READY=false;
+setTimeout(function(){ if(!window.__ASCII_READY){
+  var m=document.getElementById('overlay-msg');
+  if(m) m.textContent='Gagal memuat three.js dari CDN — cek koneksi internet lalu muat ulang.';
+}},8000);
+</script>
+</head>
+<body>
+<div id="hud">
+  <div id="cross">+</div>
+  <div id="legend">WASD Gerak · SHIFT Lari · SPASI Lompat · ESC Menu</div>
+  <div id="stats"></div>
+</div>
+<div id="overlay">
+  <div style="font-size:42px;letter-spacing:6px">KASTIL ASCII</div>
+  <div style="margin:8px 0;font-size:16px">Dunia Terbuka 3D — three.js</div>
+  <div style="font-size:14px">WASD Bergerak · SHIFT Lari · SPASI Lompat · ESC Lepas Kursor</div>
+  <div id="overlay-msg" style="margin-top:18px;font-size:15px">Memuat three.js…</div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+
+/* ============================================================
+   KASTIL ASCII — renderer + pipeline ASCII (2-pass GPU)
+   Pass 1: scene -> sceneRT (satu texel = satu sel ASCII)
+   Pass 2: fullscreen quad -> sampling per sel + glyph ramp
+   ============================================================ */
+
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({antialias:false});
+} catch (e) {
+  const m = document.getElementById('overlay-msg');
+  if (m) m.textContent = 'WebGL tidak tersedia di browser ini.';
+  throw e;
+}
+renderer.setPixelRatio(1);
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x040509); // luminance < 0.025 -> char ' ' (langit hitam bersih)
+const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.1, 500);
+
+const clock = new THREE.Clock();
+
+/* --- Scene render target: cols x rows, satu texel = satu sel --- */
+let cols = Math.floor(innerWidth/8), rows = Math.floor(innerHeight/16);
+const sceneRT = new THREE.WebGLRenderTarget(cols, rows, {
+  minFilter: THREE.NearestFilter,
+  magFilter: THREE.NearestFilter
+});
+
+/* --- Glyph ramp atlas: 16 char sparse->dense, 16x16 px per glyph --- */
+const RAMP = " .,:;-=+*?ixX#%@";
+function buildAtlas(){
+  const c = document.createElement('canvas');
+  c.width = 16*16; c.height = 32;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.font = 'bold 26px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#fff';
+  for (let i = 0; i < 16; i++) ctx.fillText(RAMP[i], i*16+8, 16);
+  const tex = new THREE.CanvasTexture(c);
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  return tex;
+}
+const atlas = buildAtlas();
+
+/* --- ASCII pass: fullscreen quad, sampling per sel + glyph --- */
+const asciiScene = new THREE.Scene();
+const asciiVert = 'varying vec2 vUv; void main(){vUv=uv; gl_Position=vec4(position.xy,0.,1.);}';
+const asciiFrag = `
+precision highp float;
+varying vec2 vUv;
+uniform sampler2D tScene;
+uniform sampler2D tAtlas;
+uniform vec2 uGrid;
+void main(){
+  vec2 cell = floor(vUv * uGrid);
+  vec2 within = fract(vUv * uGrid);
+  vec3 s = texture2D(tScene, (cell + 0.5) / uGrid).rgb;
+  vec3 col = pow(s, vec3(1.0/2.2));               // linear -> display
+  float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+  float idx = clamp(floor(lum * 16.0), 0.0, 15.0);
+  vec2 auv = vec2((idx + within.x) / 16.0, within.y);
+  float a = texture2D(tAtlas, auv).a;
+  gl_FragColor = vec4(col * a, 1.0);
+}`;
+const asciiMat = new THREE.ShaderMaterial({
+  vertexShader: asciiVert,
+  fragmentShader: asciiFrag,
+  uniforms: {
+    tScene: {value: sceneRT.texture},
+    tAtlas: {value: atlas},
+    uGrid: {value: new THREE.Vector2(cols, rows)}
+  },
+  depthTest: false,
+  depthWrite: false
+});
+const asciiQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), asciiMat);
+asciiQuad.frustumCulled = false; // quad fullscreen via shader; world-bounds culling salah di sini
+asciiScene.add(asciiQuad);
+
+/* ============================================================
+   Step 2 — Terrain prosedural, cahaya, bayangan, kabut
+   ============================================================ */
+
+/* Noise deterministik: hash integer, tanpa sin */
+function hash2(ix, iz){
+  let n = (ix*374761393 + iz*668265263)|0;
+  n = Math.imul(n^(n>>>13), 1274126177);
+  return ((n^(n>>>16))>>>0)/4294967296;
+}
+function vnoise(x, z){
+  const ix = Math.floor(x), iz = Math.floor(z), fx = x-ix, fz = z-iz;
+  const sx = fx*fx*(3-2*fx), sz = fz*fz*(3-2*fz);
+  const a = hash2(ix,iz), b = hash2(ix+1,iz), c = hash2(ix,iz+1), d = hash2(ix+1,iz+1);
+  return (a+(b-a)*sx)*(1-sz)+(c+(d-c)*sx)*sz;
+}
+function terrainBase(x, z){
+  let amp = .5, f = 1, sum = 0, norm = 0;
+  for (let i=0; i<3; i++){ sum += amp*vnoise(x*.015*f, z*.015*f); norm += amp; amp *= .5; f *= 2; }
+  return sum/norm;
+}
+/* terrainHeight = satu-satunya sumber tinggi (mesh, collision, props) */
+function terrainHeight(x, z){
+  const base = (terrainBase(x, z) - .5)*22;          // [-11, 11]
+  const d = Math.hypot(x, z);
+  return THREE.MathUtils.lerp(6, base, THREE.MathUtils.smoothstep(d, 35, 70)); // dataran kastil y=6
+}
+
+/* Terrain mesh: plane 900x900, height + warna per vertex */
+const terrainGeo = new THREE.PlaneGeometry(900, 900, 200, 200);
+terrainGeo.rotateX(-Math.PI/2);
+{
+  const pos = terrainGeo.attributes.position;
+  const n = pos.count;
+  const colors = new Float32Array(n*3);
+  const c = new THREE.Color();
+  const stoneC = new THREE.Color(0x55534c);
+  const dirtC  = new THREE.Color(0x4a3b2a);
+  const grassC = new THREE.Color(0x35502a);
+  const rockC  = new THREE.Color(0x5a5852);
+  for (let i=0; i<n; i++){
+    const x = pos.getX(i), z = pos.getZ(i);
+    const h = terrainHeight(x, z);
+    pos.setY(i, h);
+    const d = Math.hypot(x, z);
+    if (d < 35){
+      c.copy(stoneC);                                        // dataran kastil: batu
+    } else {
+      c.lerpColors(dirtC, grassC, THREE.MathUtils.smoothstep(h, 1, 4));
+      c.lerp(rockC, THREE.MathUtils.smoothstep(h, 12, 18));
+    }
+    colors[i*3] = c.r; colors[i*3+1] = c.g; colors[i*3+2] = c.b;
+  }
+  terrainGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+}
+const terrain = new THREE.Mesh(terrainGeo, new THREE.MeshStandardMaterial({
+  vertexColors: true,
+  flatShading: true
+}));
+terrain.receiveShadow = true;
+scene.add(terrain);
+
+/* Cahaya: hemisphere lembut + matahari dengan bayangan */
+scene.add(new THREE.HemisphereLight(0x9db4d0, 0x2a2a26, 0.55));
+const sun = new THREE.DirectionalLight(0xfff1d6, 2.4);
+sun.position.set(80, 120, 60);
+sun.castShadow = true;
+sun.shadow.camera.left = -150;
+sun.shadow.camera.right = 150;
+sun.shadow.camera.top = 150;
+sun.shadow.camera.bottom = -150;
+sun.shadow.camera.near = 1;
+sun.shadow.camera.far = 400;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.bias = -0.0005;
+sun.shadow.camera.updateProjectionMatrix();
+scene.add(sun);
+
+/* Kabut: warna identik background -> tepi dunia tak pernah terlihat */
+scene.fog = new THREE.Fog(0x040509, 30, 190);
+
+/* ============================================================
+   Step 4 — Kastil (tabel plan) + COLLIDERS
+   y = 6 adalah permukaan dataran; lantai halaman permukaan 6.15
+   ============================================================ */
+
+const matStone     = new THREE.MeshStandardMaterial({color:0x8a857a, flatShading:true, roughness:.9});
+const matStoneDark = new THREE.MeshStandardMaterial({color:0x6b675d, flatShading:true, roughness:.9});
+const matRoof      = new THREE.MeshStandardMaterial({color:0x8a4034, flatShading:true, roughness:.9});
+const matFlag      = new THREE.MeshStandardMaterial({color:0xc23b2e, flatShading:true, roughness:.9});
+const matWin       = new THREE.MeshStandardMaterial({color:0x151515, flatShading:true, roughness:.9});
+
+const castle = new THREE.Group();
+function cbox(mat, w, h, d, x, y, z){
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z);
+  m.castShadow = true;
+  castle.add(m);
+  return m;
+}
+function ccyl(mat, r, h, x, y, z){
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, 12), mat);
+  m.position.set(x, y, z);
+  m.castShadow = true;
+  castle.add(m);
+  return m;
+}
+function ccone(mat, r, h, x, y, z){
+  const m = new THREE.Mesh(new THREE.ConeGeometry(r, h, 12), mat);
+  m.position.set(x, y, z);
+  m.castShadow = true;
+  castle.add(m);
+  return m;
+}
+
+/* Dinding (tebal 2, tinggi 6..14) + ambang gerbang + menara gerbang */
+cbox(matStone, 48, 8, 2,   0, 10, -24);   // utara
+cbox(matStone,  2, 8, 48, -24, 10, 0);    // barat
+cbox(matStone,  2, 8, 48,  24, 10, 0);    // timur
+cbox(matStone, 21, 8, 2, -13.5, 10, 24);  // selatan L (x -24..-3)
+cbox(matStone, 21, 8, 2,  13.5, 10, 24);  // selatan R (x 3..24)
+cbox(matStone,  6, 3, 2,   0, 12.5, 24);  // ambang gerbang (bukaan x -3..3, tinggi 6..11)
+cbox(matStone,  4, 11, 4, -5, 11.5, 24);  // menara gerbang kiri
+cbox(matStone,  4, 11, 4,  5, 11.5, 24);  // menara gerbang kanan
+
+/* 4 menara sudut + konak */
+for (const sx of [-1, 1]) for (const sz of [-1, 1]){
+  ccyl(matStone, 4, 13, sx*24, 12.5, sz*24);   // silinder y 6..19
+  ccone(matRoof, 4.8, 5, sx*24, 21.5, sz*24);  // konak y 19..24
+}
+
+/* Keep (puncak y=22) + 4 turret (silinder y 6..26) + konak (26..29.5) */
+cbox(matStone, 14, 16, 14, 0, 14, 0);
+for (const sx of [-1, 1]) for (const sz of [-1, 1]){
+  ccyl(matStone, 1.8, 20, sx*6, 16, sz*6);
+  ccone(matRoof, 2.2, 3.5, sx*6, 27.75, sz*6);
+}
+
+/* Lantai halaman: permukaan y=6.15 */
+{
+  const floor = cbox(matStoneDark, 46, 0.2, 46, 0, 6.05, 0);
+  floor.receiveShadow = true;
+}
+
+/* Bendera: tiang y 22..27 di keep, bidang hadap +Z */
+ccyl(matStone, 0.08, 5, 0, 24.5, 0);
+{
+  const banner = new THREE.Mesh(new THREE.PlaneGeometry(3.5, 1.8), matFlag);
+  banner.position.set(1.75, 26.4, 0);
+  banner.castShadow = true;
+  castle.add(banner);
+}
+
+/* Jendela keep: muka z=±7.05, x {-3,0,3}, y {13,18} */
+for (const z of [-7.05, 7.05])
+  for (const x of [-3, 0, 3])
+    for (const y of [13, 18])
+      cbox(matWin, 1.2, 2.4, 0.3, x, y, z);
+
+/* Crenellations: Box(1,1.5,1) InstancedMesh, y = yTop + 0.75 (berdiri di atas tepi) */
+function merlons(lines){
+  const pts = [];
+  for (const ln of lines){
+    for (let v = ln.from; v <= ln.to + 1e-9; v += 2.4){
+      if (ln.gate && v > -4 && v < 4) continue;   // area gerbang x (-4,4) di z=24
+      if (ln.axis === 'x') pts.push([v, ln.at, ln.yTop]);
+      else pts.push([ln.at, v, ln.yTop]);
+    }
+  }
+  const im = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1.5, 1), matStone, pts.length);
+  const m4 = new THREE.Matrix4();
+  for (let i = 0; i < pts.length; i++){
+    m4.makeTranslation(pts[i][0], pts[i][2] + 0.75, pts[i][1]);
+    im.setMatrixAt(i, m4);
+  }
+  im.castShadow = true;
+  castle.add(im);
+}
+/* dinding: yTop 14 (permukaan atas dinding) */
+merlons([
+  {axis:'x', from:-23, to:23, at:-24, yTop:14},                 // utara
+  {axis:'z', from:-23, to:23, at:-24, yTop:14},                 // barat
+  {axis:'z', from:-23, to:23, at: 24, yTop:14},                 // timur
+  {axis:'x', from:-23, to:23, at: 24, yTop:14, gate:true}       // selatan L+R (gerbang di-skip)
+]);
+/* rim keep: square half 6.5, yTop 22 (permukaan atas keep) */
+merlons([
+  {axis:'x', from:-6.5, to:6.5, at:-6.5, yTop:22},
+  {axis:'x', from:-6.5, to:6.5, at: 6.5, yTop:22},
+  {axis:'z', from:-6.5, to:6.5, at:-6.5, yTop:22},
+  {axis:'z', from:-6.5, to:6.5, at: 6.5, yTop:22}
+]);
+scene.add(castle);
+
+/* ============================================================
+   Colliders: box mentah (expansion radius pemain di resolve)
+   + lingkaran menara sudut; props menambah circle di Step 5
+   ============================================================ */
+
+const PLAYER_R = 0.6;
+const COLLIDERS = [
+  {type:'box', min:[-24,-25], max:[ 24,-23]},  // dinding utara
+  {type:'box', min:[-25,-24], max:[-23, 24]},  // dinding barat
+  {type:'box', min:[ 23,-24], max:[ 25, 24]},  // dinding timur
+  {type:'box', min:[-24, 23], max:[ -3, 25]},  // dinding selatan L
+  {type:'box', min:[  3, 23], max:[ 24, 25]},  // dinding selatan R
+  {type:'box', min:[ -7, 22], max:[ -3, 26]},  // menara gerbang kiri
+  {type:'box', min:[  3, 22], max:[  7, 26]},  // menara gerbang kanan
+  {type:'box', min:[ -7, -7], max:[  7,  7]},  // keep
+  {type:'circle', x:-24, z:-24, r:4},
+  {type:'circle', x:-24, z: 24, r:4},
+  {type:'circle', x: 24, z:-24, r:4},
+  {type:'circle', x: 24, z: 24, r:4}
+];
+
+/* ============================================================
+   Step 5 — Props: pohon (InstancedMesh) + batu, seed 1337
+   Dunia identik tiap load; koridor gerbang/spawn dikosongkan
+   ============================================================ */
+
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}}
+const rand = mulberry32(1337);
+
+/* Kandidat polar r 38..300 */
+function propPos(){
+  const r = 38 + rand() * (300 - 38);
+  const ang = rand() * Math.PI * 2;
+  return [Math.cos(ang) * r, Math.sin(ang) * r];
+}
+function propBlocked(x, z){
+  if (Math.abs(x) < 36 && Math.abs(z) < 36) return true;      // area kastil
+  if (Math.hypot(x, z - 90) < 8) return true;                 // spawn
+  if (Math.abs(x) < 6 && z >= 26 && z <= 95) return true;     // koridor gerbang
+  return false;
+}
+
+const PROPS = {trees: [], rocks: []};
+
+/* Pohon: 220 instance — trunk Cylinder(0.25,0.35,2), canopy Cone(1.7,5) */
+{
+  const trunks = new THREE.InstancedMesh(
+    new THREE.CylinderGeometry(0.25, 0.35, 2),
+    new THREE.MeshStandardMaterial({color:0x5f4632}), 220);
+  const canopies = new THREE.InstancedMesh(
+    new THREE.ConeGeometry(1.7, 5),
+    new THREE.MeshStandardMaterial({color:0x2c4a24}), 220);
+  trunks.castShadow = true;
+  canopies.castShadow = true;
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion();
+  const e = new THREE.Euler(), p = new THREE.Vector3(), sc = new THREE.Vector3();
+  let count = 0, tries = 0;
+  while (count < 220 && tries < 4000){
+    tries++;
+    const cand = propPos();
+    const x = cand[0], z = cand[1];
+    if (propBlocked(x, z)) continue;
+    const s = 0.7 + rand() * 0.8;                 // scale 0.7..1.5
+    const rot = rand() * Math.PI * 2;             // rotasi-Y acak
+    const y = terrainHeight(x, z);
+    e.set(0, rot, 0);
+    q.setFromEuler(e);
+    sc.set(s, s, s);
+    m4.compose(p.set(x, y + 1 * s, z), q, sc);    // trunk: bottom di permukaan
+    trunks.setMatrixAt(count, m4);
+    m4.compose(p.set(x, y + (2 + 2.5) * s, z), q, sc); // canopy di pucuk trunk
+    canopies.setMatrixAt(count, m4);
+    const rad = 0.45 * s;
+    COLLIDERS.push({type:'circle', x, z, r:rad});
+    PROPS.trees.push({x, z, r:rad, s});
+    count++;
+  }
+  trunks.count = canopies.count = count;
+  trunks.instanceMatrix.needsUpdate = true;
+  canopies.instanceMatrix.needsUpdate = true;
+  scene.add(trunks);
+  scene.add(canopies);
+}
+
+/* Batu: 90 instance — Icosahedron(1,0), non-uniform scale, sebagian tertimbun */
+{
+  const rocks = new THREE.InstancedMesh(
+    new THREE.IcosahedronGeometry(1, 0),
+    new THREE.MeshStandardMaterial({color:0x2e2d2b}), 90);
+  rocks.castShadow = true;
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion();
+  const p = new THREE.Vector3(), sc = new THREE.Vector3();
+  let count = 0, tries = 0;
+  while (count < 90 && tries < 4000){
+    tries++;
+    const cand = propPos();
+    const x = cand[0], z = cand[1];
+    if (propBlocked(x, z)) continue;
+    const sx = 0.5 + rand() * 1.7;                // 0.5..2.2
+    const sz = 0.5 + rand() * 1.7;
+    const sy = (0.5 + rand() * 1.7) * 0.6;        // gepeng: sy x0.6
+    const y = terrainHeight(x, z) + 0.3 * sy;     // sebagian tertimbun
+    m4.compose(p.set(x, y, z), q, sc.set(sx, sy, sz));
+    rocks.setMatrixAt(count, m4);
+    const rad = 0.7 * sx;
+    COLLIDERS.push({type:'circle', x, z, r:rad});
+    PROPS.rocks.push({x, z, r:rad});
+    count++;
+  }
+  rocks.count = count;
+  rocks.instanceMatrix.needsUpdate = true;
+  scene.add(rocks);
+}
+
+/* Satu iterasi per frame: langkah maks 14*0.05=0.7 < tebal dinding 2 */
+function resolveColliders(){
+  for (const c of COLLIDERS){
+    if (c.type === 'box'){
+      const minX = c.min[0] - PLAYER_R, maxX = c.max[0] + PLAYER_R;
+      const minZ = c.min[1] - PLAYER_R, maxZ = c.max[1] + PLAYER_R;
+      if (pos.x > minX && pos.x < maxX && pos.z > minZ && pos.z < maxZ){
+        const dL = pos.x - minX, dR = maxX - pos.x;
+        const dT = pos.z - minZ, dB = maxZ - pos.z;
+        const m = Math.min(dL, dR, dT, dB);
+        if (m === dL)      pos.x = minX - 0.01;
+        else if (m === dR) pos.x = maxX + 0.01;
+        else if (m === dT) pos.z = minZ - 0.01;
+        else               pos.z = maxZ + 0.01;
+      }
+    } else {
+      const dx = pos.x - c.x, dz = pos.z - c.z;
+      const d = Math.hypot(dx, dz);
+      const rr = c.r + PLAYER_R;
+      if (d < rr){
+        if (d < 1e-6){ pos.x = c.x + rr; }
+        else { pos.x = c.x + dx * rr / d; pos.z = c.z + dz * rr / d; }
+      }
+    }
+  }
+}
+
+/* ============================================================
+   Step 3 — Player controller: WASD + mouse look + fisika
+   ============================================================ */
+
+const EYE = 1.7;
+const pos = new THREE.Vector3(0, terrainHeight(0, 90) + EYE, 90); // spawn hadap -Z (kastil)
+const vel = new THREE.Vector3();
+let yaw = 0, pitch = 0, grounded = false;
+
+/* Input: key tracking aktif selalu (bisa diverifikasi tanpa pointer lock) */
+const keys = new Set();
+addEventListener('keydown', e => keys.add(e.code));
+addEventListener('keyup', e => keys.delete(e.code));
+
+/* Pointer lock: klik overlay -> lock; lock -> overlay hilang */
+const overlayEl = document.getElementById('overlay');
+overlayEl.addEventListener('click', () => {
+  const p = renderer.domElement.requestPointerLock();
+  if (p && typeof p.catch === 'function') p.catch(() => {}); // headless boleh gagal lock
+});
+document.addEventListener('pointerlockchange', () => {
+  overlayEl.style.display = document.pointerLockElement ? 'none' : 'flex';
+});
+document.addEventListener('mousemove', e => {
+  if (document.pointerLockElement){
+    yaw -= e.movementX * 0.0022;
+    pitch = THREE.MathUtils.clamp(pitch - e.movementY * 0.0022, -1.5, 1.5);
+  }
+});
+
+function updatePlayer(dt){
+  /* lompat hanya saat menyentuh tanah */
+  if (keys.has('Space') && grounded){ vel.y = 9.5; grounded = false; }
+
+  /* wish direction (yaw-relative), target velocity + smoothing exponential */
+  const fwdX = -Math.sin(yaw), fwdZ = -Math.cos(yaw);
+  const rgtX = Math.cos(yaw),  rgtZ = -Math.sin(yaw);
+  const ax = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+  const az = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
+  let wx = fwdX*az + rgtX*ax, wz = fwdZ*az + rgtZ*ax;
+  const wl = Math.hypot(wx, wz);
+  if (wl > 1e-6){ wx /= wl; wz /= wl; }
+  const speed = keys.has('ShiftLeft') ? 14 : 8;
+  const k = 1 - Math.exp(-12*dt);
+  vel.x += (wx*speed - vel.x) * k;
+  vel.z += (wz*speed - vel.z) * k;
+
+  /* gravitasi + integrasi */
+  vel.y -= 26*dt;
+  pos.x += vel.x*dt;
+  pos.y += vel.y*dt;
+  pos.z += vel.z*dt;
+
+  /* collider XZ (dinding/keep/menara/props) */
+  resolveColliders();
+
+  /* tanah: lantai halaman 6.15 (|x|,|z|<23), selain itu terrain */
+  const groundY = (Math.abs(pos.x) < 23 && Math.abs(pos.z) < 23)
+    ? 6.15
+    : terrainHeight(pos.x, pos.z);
+  if (pos.y - EYE <= groundY){
+    pos.y = groundY + EYE;
+    vel.y = 0;
+    grounded = true;
+  } else {
+    grounded = false;
+  }
+
+  /* clamp dunia */
+  const d = Math.hypot(pos.x, pos.z);
+  if (d > 260){ pos.x *= 260/d; pos.z *= 260/d; }
+
+  camera.rotation.set(pitch, yaw, 0, 'YXZ');
+  camera.position.copy(pos);
+}
+
+/* ============================================================
+   Resize + HUD stats + render loop
+   ============================================================ */
+
+/* aspect = aspek LAYAR (bukan RT) supaya hasil tidak gepeng */
+function resize(){
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w/h;
+  camera.updateProjectionMatrix();
+  cols = Math.max(1, Math.floor(w/8));
+  rows = Math.max(1, Math.floor(h/16));
+  sceneRT.setSize(cols, rows);
+  asciiMat.uniforms.uGrid.value.set(cols, rows);
+}
+addEventListener('resize', resize);
+resize();
+
+const statsEl = document.getElementById('stats');
+let fpsFrames = 0, fpsLast = performance.now(), fps = 0;
+
+let firstFrame = true;
+function tick(){
+  requestAnimationFrame(tick);
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  updatePlayer(dt);
+
+  renderer.setRenderTarget(sceneRT);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  renderer.render(asciiScene, camera);
+
+  fpsFrames++;
+  const now = performance.now();
+  if (now - fpsLast >= 500){
+    fps = Math.round(fpsFrames * 1000 / (now - fpsLast));
+    fpsFrames = 0;
+    fpsLast = now;
+  }
+  statsEl.textContent =
+    'POS ' + pos.x.toFixed(1) + ' ' + pos.y.toFixed(1) + ' ' + pos.z.toFixed(1) +
+    '  FPS ' + fps;
+
+  if (firstFrame){
+    firstFrame = false;
+    window.__ASCII_READY = true;
+    const m = document.getElementById('overlay-msg');
+    if (m) m.textContent = '[ Klik untuk bermain ]';
+  }
+}
+tick();
+</script>
+</body>
+</html>
